@@ -18,7 +18,8 @@ use ftdi_impl as ftdi;
 mod commands;
 
 use self::commands::{
-    JtagCommand, ReadRegisterCommand, TransferDrCommand, TransferIrCommand, WriteRegisterCommand,
+    JtagCommand, ReadRegisterCommand, ShiftTmsCommand, TransferDrCommand, TransferIrCommand,
+    WriteRegisterCommand,
 };
 
 use super::{BatchExecutionError, CommandResult};
@@ -110,11 +111,13 @@ impl JtagAdapter {
     }
 
     /// Reset and go to RUN-TEST/IDLE
-    pub fn reset(&mut self) -> Result<Vec<u8>, DebugProbeError> {
-        self.run_jtag_cmd(TransferIrCommand::new(
-            [0xff, 0xff, 0xff, 0xff, 0x7f].to_vec(),
-            40,
-        ))
+    pub fn reset(&mut self) -> Result<(), DebugProbeError> {
+        self.run_jtag_cmd_no_result(
+            // Shift 34 bits TMS high to return TAP to TEST-LOGIC-RESET,
+            // then shift bit TMS low to transition TAP to RUN-TEST/IDLE
+            // MSB in each byte to send is held static on TDI for all TMS bits clocked
+            ShiftTmsCommand::new([0x7f, 0x7f, 0x7f, 0x7f, 0x3f].to_vec(), 40),
+        )
     }
 
     /// Shift to IR and return to IDLE
@@ -247,7 +250,7 @@ impl JtagAdapter {
         Ok(targets)
     }
 
-    fn run_jtag_cmd(&mut self, mut cmd: impl JtagCommand) -> Result<Vec<u8>, DebugProbeError> {
+    fn _run_jtag_cmd(&mut self, cmd: &mut impl JtagCommand) -> Result<(), DebugProbeError> {
         // Copy generated command bytes into vec and write to device
         let mut out_buffer = Vec::<u8>::new();
         cmd.add_bytes(&mut out_buffer);
@@ -255,6 +258,12 @@ impl JtagAdapter {
         self.device
             .write_all(&out_buffer)
             .map_err(|e| DebugProbeError::ProbeSpecific(Box::new(e)))?;
+
+        Ok(())
+    }
+
+    fn run_jtag_cmd(&mut self, mut cmd: impl JtagCommand) -> Result<Vec<u8>, DebugProbeError> {
+        self._run_jtag_cmd(&mut cmd)?;
 
         // Read back response, ensure received correct amt of data
         let resp = self.read_response(cmd.bytes_to_read())?;
@@ -264,6 +273,10 @@ impl JtagAdapter {
             _ => panic!("Internal error occurred. Only expect VecU8 for FTDI data"),
         };
         Ok(read_res)
+    }
+
+    fn run_jtag_cmd_no_result(&mut self, mut cmd: impl JtagCommand) -> Result<(), DebugProbeError> {
+        self._run_jtag_cmd(&mut cmd)
     }
 
     pub fn select_target(&mut self, idcode: u32) -> Result<(), DebugProbeError> {
@@ -378,7 +391,8 @@ impl DebugProbe for FtdiProbe {
             self.adapter.select_target(taps[0].idcode)?;
         } else {
             let known_idcodes = [
-                0x1000563d, // GD32VF103
+                // GD32VF103 (other TAP detected on this chip is boundary scan, 0x790007a3)
+                0x1000563d,
             ];
             let idcode = taps
                 .iter()
