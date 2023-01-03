@@ -1,9 +1,13 @@
 //! Debug sequences to operate special requirements RISC-V targets.
 
-use super::communication_interface::RiscvCommunicationInterface;
+use super::{
+    communication_interface::{RiscvCommunicationInterface, RiscvError},
+    Dmstatus,
+};
 use std::sync::Arc;
 
 pub mod esp32c3;
+pub mod gd32vf103cbt6;
 
 /// A interface to operate debug sequences for RISC-V targets.
 ///
@@ -11,6 +15,20 @@ pub mod esp32c3;
 pub trait RiscvDebugSequence: Send + Sync {
     /// Executed when the probe establishes a connection to the target.
     fn on_connect(&self, _interface: &mut RiscvCommunicationInterface) -> Result<(), crate::Error> {
+        Ok(())
+    }
+
+    /// CHANGE ME
+    fn check_cores_reset(
+        &self,
+        interface: &mut RiscvCommunicationInterface,
+    ) -> Result<(), crate::Error> {
+        let readback: Dmstatus = interface.read_dm_register()?;
+
+        if !(readback.allhavereset() && readback.allhalted()) {
+            return Err(RiscvError::RequestNotAcknowledged.into());
+        }
+
         Ok(())
     }
 }

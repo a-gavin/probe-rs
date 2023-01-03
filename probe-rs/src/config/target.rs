@@ -12,7 +12,7 @@ use crate::architecture::arm::sequences::{
     stm32h7::Stm32h7,
     ArmDebugSequence,
 };
-use crate::architecture::riscv::sequences::esp32c3::ESP32C3;
+use crate::architecture::riscv::sequences::{esp32c3::ESP32C3, gd32vf103cbt6::GD32VF103CBT6};
 use crate::architecture::riscv::sequences::{DefaultRiscvSequence, RiscvDebugSequence};
 use crate::flashing::FlashLoader;
 use std::sync::Arc;
@@ -107,6 +107,9 @@ impl Target {
         } else if chip.name.starts_with("esp32c3") {
             tracing::warn!("Using custom sequence for ESP32c3");
             debug_sequence = DebugSequence::Riscv(ESP32C3::create());
+        } else if chip.name.starts_with("GD32VF103CBT6") {
+            tracing::warn!("Using custom sequence for GD32VF103CBT6");
+            debug_sequence = DebugSequence::Riscv(GD32VF103CBT6::create());
         } else if chip.name.starts_with("nRF5340") {
             tracing::warn!("Using custom sequence for nRF5340");
             debug_sequence = DebugSequence::Arm(Nrf5340::create());

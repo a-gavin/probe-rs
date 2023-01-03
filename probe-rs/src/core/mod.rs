@@ -772,14 +772,24 @@ impl SpecificCoreState {
         })
     }
 
-    pub(crate) fn attach_riscv<'probe>(
+    pub(crate) fn attach_riscv<'probe, 'target: 'probe>(
         &'probe mut self,
         state: &'probe mut CoreState,
         interface: &'probe mut RiscvCommunicationInterface,
+        target: &'target Target,
     ) -> Result<Core<'probe>, Error> {
+        let debug_sequence = match &target.debug_sequence {
+            crate::config::DebugSequence::Arm(_) => {
+                return Err(Error::UnableToOpenProbe(
+                    "Core architecture and Probe mismatch.",
+                ))
+            }
+            crate::config::DebugSequence::Riscv(sequence) => sequence.clone(),
+        };
+
         Ok(match self {
             SpecificCoreState::Riscv(s) => Core::new(
-                crate::architecture::riscv::Riscv32::new(interface, s),
+                crate::architecture::riscv::Riscv32::new(interface, s, debug_sequence),
                 state,
             ),
             _ => {

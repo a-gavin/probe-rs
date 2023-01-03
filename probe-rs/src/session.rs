@@ -103,7 +103,7 @@ impl ArchitectureInterface {
 
                 core.attach_arm(core_state, memory, target)
             }
-            ArchitectureInterface::Riscv(state) => core.attach_riscv(core_state, state),
+            ArchitectureInterface::Riscv(state) => core.attach_riscv(core_state, state, target),
         }
     }
 }

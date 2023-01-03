@@ -15,7 +15,10 @@ use crate::{CoreStatus, Error, HaltReason, MemoryInterface, RegisterId};
 
 use bitfield::bitfield;
 use register::RISCV_REGISTERS;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use self::sequences::RiscvDebugSequence;
 
 #[macro_use]
 mod register;
@@ -29,6 +32,7 @@ pub mod sequences;
 pub struct Riscv32<'probe> {
     interface: &'probe mut RiscvCommunicationInterface,
     state: &'probe mut RiscVState,
+    sequence: Arc<dyn RiscvDebugSequence>,
 }
 
 impl<'probe> Riscv32<'probe> {
@@ -36,8 +40,13 @@ impl<'probe> Riscv32<'probe> {
     pub fn new(
         interface: &'probe mut RiscvCommunicationInterface,
         state: &'probe mut RiscVState,
+        sequence: Arc<dyn RiscvDebugSequence>,
     ) -> Self {
-        Self { interface, state }
+        Self {
+            interface,
+            state,
+            sequence,
+        }
     }
 
     fn read_csr(&mut self, address: u16) -> Result<u32, RiscvError> {
@@ -218,11 +227,7 @@ impl<'probe> CoreInterface for Riscv32<'probe> {
         }
 
         // check that cores have reset
-        let readback: Dmstatus = self.interface.read_dm_register()?;
-
-        if !(readback.allhavereset() && readback.allhalted()) {
-            return Err(RiscvError::RequestNotAcknowledged.into());
-        }
+        self.sequence.check_cores_reset(&mut self.interface)?;
 
         // acknowledge the reset, clear the halt request
         let mut dmcontrol = Dmcontrol(0);
