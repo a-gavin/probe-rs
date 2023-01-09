@@ -1,6 +1,7 @@
 use std::io;
 
 use bitvec::{order::Lsb0, prelude::BitVec, slice::BitSlice};
+use ftdi_mpsse::*;
 
 use crate::{probe::CommandResult, DebugProbeError};
 
@@ -149,9 +150,9 @@ impl ShiftIrCommand {
     pub fn new(data: Vec<u8>, bits: usize) -> ShiftIrCommand {
         ShiftIrCommand {
             subcommands: [
-                Box::new(ShiftTmsCommand::new(vec![0b0011], 4)),
+                Box::new(ShiftTmsCommand::new(vec![0b0011], 4)), // RUN-TEST-IDLE to SHIFT-IR
                 Box::new(ShiftTdiCommand::new(data, bits)),
-                Box::new(ShiftTmsCommand::new(vec![0b01], 2)),
+                Box::new(ShiftTmsCommand::new(vec![0b01], 2)), // SHIFT-IR to RUN-TEST-IDLE, SHIFT-IR to EXIT-1-IR bit clocked in TransferTdiCommand
             ],
         }
     }
@@ -190,9 +191,9 @@ impl TransferDrCommand {
     pub fn new(data: Vec<u8>, bits: usize) -> TransferDrCommand {
         TransferDrCommand {
             subcommands: vec![
-                Box::new(ShiftTmsCommand::new(vec![0b001], 3)),
+                Box::new(ShiftTmsCommand::new(vec![0b001], 3)), // RUN-TEST-IDLE to SHIFT-DR
                 Box::new(TransferTdiCommand::new(data, bits)),
-                Box::new(ShiftTmsCommand::new(vec![0b01], 2)),
+                Box::new(ShiftTmsCommand::new(vec![0b01], 2)), // SHIFT-DR to RUN-TEST-IDLE, SHIFT-DR to EXIT-1-DR bit clocked in TransferTdiCommand
             ],
         }
     }
@@ -237,6 +238,9 @@ struct ShiftTmsCommand {
 }
 
 impl ShiftTmsCommand {
+    /// Most significant bit in each byte of `data` is transferred on TDI, not as TMS.
+    ///
+    /// Can only clock up to 7 bits on TMS for each FTDI clock TMS command
     pub fn new(data: Vec<u8>, bits: usize) -> ShiftTmsCommand {
         assert!(bits > 0);
         assert!((bits + 7) / 8 <= data.len());
@@ -247,24 +251,29 @@ impl ShiftTmsCommand {
 
 impl JtagCommand for ShiftTmsCommand {
     fn add_bytes(&mut self, buffer: &mut Vec<u8>) {
-        let mut command = vec![];
+        let mut command = MpsseCmdBuilder::new();
 
+        // Clock Data to TMS pin, no read.
+        //
+        // Can only clock 7 TMS bits at a time, as 8th bit reserved for TDI output.
+        // However, this is never called where we transfer TDI data at same time,
+        // so TDI arg always false in clock_tms_out()
+        //
+        // See section 3.5 of https://www.ftdichip.com/Support/Documents/AppNotes/AN_108_Command_Processor_for_MPSSE_and_MCU_Host_Bus_Emulation_Modes.pdf
         let mut bits = self.bits;
         let mut data: &[u8] = &self.data;
         while bits > 0 {
             if bits >= 8 {
-                // 0x4b = Clock Data to TMS pin (no read)
-                // see https://www.ftdichip.com/Support/Documents/AppNotes/AN_108_Command_Processor_for_MPSSE_and_MCU_Host_Bus_Emulation_Modes.pdf
-                command.extend_from_slice(&[0x4b, 0x07, data[0]]);
+                command = command.clock_tms_out(ClockTMSOut::NegEdge, data[0], false, 7);
                 data = &data[1..];
                 bits -= 8;
             } else {
-                command.extend_from_slice(&[0x4b, (bits - 1) as u8, data[0]]);
+                command = command.clock_tms_out(ClockTMSOut::NegEdge, data[0], false, bits as u8);
                 bits = 0;
             }
         }
 
-        buffer.extend_from_slice(&command);
+        buffer.extend_from_slice(command.as_slice());
     }
 
     fn bytes_to_read(&self) -> usize {
@@ -293,37 +302,43 @@ impl JtagCommand for ShiftTdiCommand {
         assert!(self.bits > 0);
         assert!((self.bits + 7) / 8 <= self.data.len());
 
-        let mut command = vec![];
+        let mut command = MpsseCmdBuilder::new();
         let mut bits = self.bits;
         let mut data: &[u8] = &self.data;
 
+        // Preserve one data bit for clocking out with TMS at end of ShiftTdiCommand
         let full_bytes = (bits - 1) / 8;
+
+        // Clock out full byte data
         if full_bytes > 0 {
             assert!(full_bytes <= 65536);
 
-            command.extend_from_slice(&[0x19]);
-            let n: u16 = (full_bytes - 1) as u16;
-            command.extend_from_slice(&n.to_le_bytes());
-            command.extend_from_slice(&data[..full_bytes]);
+            command = command.clock_data_out(ClockDataOut::LsbNeg, &data[..full_bytes]);
 
             bits -= full_bytes * 8;
             data = &data[full_bytes..];
         }
-        assert!(bits <= 8);
 
-        if bits > 0 {
-            let byte = data[0];
-            if bits > 1 {
-                let n = (bits - 2) as u8;
-                command.extend_from_slice(&[0x1b, n, byte]);
-            }
+        // Clock out data less than full byte
+        // Always have at least one bit leftover to clock TMS bit
+        assert!(0 < bits && bits <= 8);
+        let byte = data[0];
 
-            let last_bit = (byte >> (bits - 1)) & 0x01;
-            let tms_byte = 0x01 | (last_bit << 7);
-            command.extend_from_slice(&[0x4b, 0x00, tms_byte]);
+        // Clock out everything other than last data bit (last bit transferred with TMS in next command)
+        if bits > 1 {
+            command = command.clock_bits_out(ClockBitsOut::LsbNeg, byte, (bits - 1) as u8);
         }
 
-        buffer.extend_from_slice(&command);
+        // Clock out last bit of TDI in conjunction with first bit of TMS
+        // ShiftTdiCommand only used in ShiftIrCommand, which always returns to RUN-TEST-IDLE TAP state
+        // after ShiftTdiCommand completion, so begin return to RUN-TEST-IDLE state here
+        let last_tdi_bit = (byte >> (bits - 1)) & 0x01;
+        let tms_cmd_data = 0x01 | (last_tdi_bit << 7); // Clock 1 to TMS to go from SHIFT-IR to EXIT-1-IR
+
+        // TDI arg always false as we set it above using last_tdi_bit
+        command = command.clock_tms_out(ClockTMSOut::NegEdge, tms_cmd_data, false, 1);
+
+        buffer.extend_from_slice(command.as_slice());
     }
 
     fn bytes_to_read(&self) -> usize {
@@ -358,40 +373,48 @@ impl JtagCommand for TransferTdiCommand {
         assert!(self.bits > 0);
         assert!((self.bits + 7) / 8 <= self.data.len());
 
-        let mut command = vec![];
+        let mut command = MpsseCmdBuilder::new();
 
         let mut bits = self.bits;
         let mut data: &[u8] = &self.data;
 
+        // Preserve one data bit for clocking out with TMS at end of ShiftTdiCommand
         let full_bytes = (bits - 1) / 8;
+
+        // Clock out full byte data
         if full_bytes > 0 {
             assert!(full_bytes <= 65536);
 
-            command.extend_from_slice(&[0x39]);
-            let n: u16 = (full_bytes - 1) as u16;
-            command.extend_from_slice(&n.to_le_bytes());
-            command.extend_from_slice(&data[..full_bytes]);
+            command = command.clock_data(ClockData::LsbPosIn, &data[..full_bytes]);
 
             bits -= full_bytes * 8;
             data = &data[full_bytes..];
         }
-        assert!(0 < bits && bits <= 8);
 
+        // Clock out data less than full byte
+        // Always have at least one bit leftover to clock TMS bit
+        assert!(0 < bits && bits <= 8);
         let byte = data[0];
+
+        // Clock out everything other than last data bit (last bit transferred with TMS in next command)
         if bits > 1 {
-            let n = (bits - 2) as u8;
-            command.extend_from_slice(&[0x3b, n, byte]);
+            command = command.clock_bits(ClockBits::LsbPosIn, byte, (bits - 1) as u8);
         }
 
-        let last_bit = (byte >> (bits - 1)) & 0x01;
-        let tms_byte = 0x01 | (last_bit << 7);
-        command.extend_from_slice(&[0x6b, 0x00, tms_byte]);
+        // Clock out last bit of TDI in conjunction with first bit of TMS
+        // TransferTdiCommand only used in TransferDrCommand, which always returns to RUN-TEST-IDLE TAP state
+        // after TransferTdiCommand completion, so begin return to RUN-TEST-IDLE state here
+        let last_tdi_bit = (byte >> (bits - 1)) & 0x01;
+        let tms_cmd_data = 0x01 | (last_tdi_bit << 7); // Clock 1 to TMS to go from SHIFT-DR to EXIT-1-DR
 
-        buffer.extend_from_slice(&command);
+        // TDI arg always false as we set it above using last_tdi_bit
+        command = command.clock_tms(ClockTMS::NegTMSPosTDO, tms_cmd_data, false, 1);
 
-        let mut expect_bytes = full_bytes + 1;
+        buffer.extend_from_slice(command.as_slice());
+
+        let mut expect_bytes = full_bytes + 1; // Plus one for TMS command
         if bits > 1 {
-            expect_bytes += 1;
+            expect_bytes += 1; // Plus one if more than one bit leftover
         }
 
         self.bits = bits;

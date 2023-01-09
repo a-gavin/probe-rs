@@ -966,6 +966,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ftdi-mpsse"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa7cfcda69930a8d2fdcdd7ffb9234fe4c79a8c73934ed4904327d77bfb5078a"
+dependencies = [
+ "static_assertions",
+]
+
+[[package]]
 name = "funty"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2109,6 +2118,7 @@ dependencies = [
  "bitvec",
  "clap",
  "enum-primitive-derive",
+ "ftdi-mpsse",
  "gimli",
  "hexdump",
  "hidapi",
