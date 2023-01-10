@@ -15,6 +15,48 @@ pub trait JtagCommand: std::fmt::Debug + Send {
     fn process_output(&self, data: &[u8]) -> Result<CommandResult, DebugProbeError>;
 }
 
+// ReadRegisterCommand and WriteRegisterCommand have same structure
+// save that ReadRegisterCommand passes None for data and WriteRegisterCommand
+// passes Some(Vec<u8>) in creating the TargetTransferCommand
+#[derive(Debug)]
+pub struct ReadRegisterCommand {
+    subcommands: [Box<dyn JtagCommand>; 2],
+}
+
+impl ReadRegisterCommand {
+    pub(super) fn new(
+        address: u32,
+        len: usize,
+        idle_cycles: usize,
+        chain_params: ChainParams,
+    ) -> io::Result<ReadRegisterCommand> {
+        let target_transfer = TargetTransferCommand::new(address, None, len, chain_params)?;
+        let idle = IdleCommand::new(idle_cycles);
+
+        Ok(ReadRegisterCommand {
+            subcommands: [Box::new(target_transfer), Box::new(idle)],
+        })
+    }
+}
+
+impl JtagCommand for ReadRegisterCommand {
+    fn add_bytes(&mut self, buffer: &mut Vec<u8>) {
+        for subcommand in &mut self.subcommands {
+            subcommand.add_bytes(buffer);
+        }
+    }
+
+    fn bytes_to_read(&self) -> usize {
+        self.subcommands.iter().map(|e| e.bytes_to_read()).sum()
+    }
+
+    fn process_output(&self, data: &[u8]) -> Result<CommandResult, DebugProbeError> {
+        let r = self.subcommands[0].process_output(&data[0..(self.subcommands[0].bytes_to_read())]);
+        self.subcommands[1].process_output(&data[self.subcommands[0].bytes_to_read()..])?;
+        r
+    }
+}
+
 #[derive(Debug)]
 pub struct WriteRegisterCommand {
     subcommands: [Box<dyn JtagCommand>; 2],
@@ -28,7 +70,7 @@ impl WriteRegisterCommand {
         idle_cycles: usize,
         chain_params: ChainParams,
     ) -> io::Result<WriteRegisterCommand> {
-        let target_transfer = TargetTransferCommand::new(address, data, len, chain_params)?;
+        let target_transfer = TargetTransferCommand::new(address, Some(data), len, chain_params)?;
         let idle = IdleCommand::new(idle_cycles);
 
         Ok(WriteRegisterCommand {
@@ -66,7 +108,7 @@ struct TargetTransferCommand {
 impl TargetTransferCommand {
     pub fn new(
         address: u32,
-        data: Vec<u8>,
+        data: Option<Vec<u8>>,
         len: usize,
         chain_params: ChainParams,
     ) -> io::Result<TargetTransferCommand> {
@@ -84,8 +126,9 @@ impl TargetTransferCommand {
         let shift_ir_cmd = ShiftIrCommand::new(ir.to_le_bytes().to_vec(), irbits);
 
         let drbits = params.drpre + len + params.drpost;
-        let request = {
-            let data = BitSlice::<u8, Lsb0>::from_slice(&data);
+        let request = if let Some(data_slice) = data {
+            // Write
+            let data = BitSlice::<u8, Lsb0>::from_slice(&data_slice);
             let mut data = BitVec::<u8, Lsb0>::from_bitslice(data);
             data.truncate(len);
 
@@ -95,6 +138,9 @@ impl TargetTransferCommand {
             buf.resize(buf.len() + params.drpost, false);
 
             buf.into_vec()
+        } else {
+            // Read
+            vec![0; (drbits + 7) / 8]
         };
 
         let transfer_dr = TransferDrCommand::new(request.to_vec(), drbits);
@@ -183,7 +229,7 @@ impl JtagCommand for ShiftIrCommand {
 }
 
 #[derive(Debug)]
-struct TransferDrCommand {
+pub(super) struct TransferDrCommand {
     subcommands: Vec<Box<dyn JtagCommand>>,
 }
 
@@ -232,7 +278,56 @@ impl JtagCommand for TransferDrCommand {
 }
 
 #[derive(Debug)]
-struct ShiftTmsCommand {
+pub(super) struct TransferIrCommand {
+    subcommands: Vec<Box<dyn JtagCommand>>,
+}
+
+impl TransferIrCommand {
+    pub fn new(data: Vec<u8>, bits: usize) -> TransferIrCommand {
+        TransferIrCommand {
+            subcommands: vec![
+                Box::new(ShiftTmsCommand::new(vec![0b0011], 4)), // RUN-TEST-IDLE to SHIFT-IR
+                Box::new(TransferTdiCommand::new(data, bits)),
+                Box::new(ShiftTmsCommand::new(vec![0b01], 2)), // SHIFT-IR to RUN-TEST-IDLE, SHIFT-IR to EXIT-1-IR bit clocked in TransferTdiCommand
+            ],
+        }
+    }
+}
+
+impl JtagCommand for TransferIrCommand {
+    fn add_bytes(&mut self, buffer: &mut Vec<u8>) {
+        for subcommand in &mut self.subcommands {
+            subcommand.add_bytes(buffer);
+        }
+    }
+
+    fn bytes_to_read(&self) -> usize {
+        self.subcommands.iter().map(|e| e.bytes_to_read()).sum()
+    }
+
+    fn process_output(&self, data: &[u8]) -> Result<CommandResult, DebugProbeError> {
+        let mut start = 0usize;
+
+        let end = start + self.subcommands[0].bytes_to_read();
+        let cmd_data = data[start..end].to_vec();
+        self.subcommands[0].process_output(&cmd_data)?;
+        start += self.subcommands[0].bytes_to_read();
+
+        let end = start + self.subcommands[1].bytes_to_read();
+        let cmd_data = data[start..end].to_vec();
+        let reply = self.subcommands[1].process_output(&cmd_data);
+        start += self.subcommands[1].bytes_to_read();
+
+        let end = start + self.subcommands[2].bytes_to_read();
+        let cmd_data = data[start..end].to_vec();
+        self.subcommands[2].process_output(&cmd_data)?;
+
+        reply
+    }
+}
+
+#[derive(Debug)]
+pub struct ShiftTmsCommand {
     data: Vec<u8>,
     bits: usize,
 }
@@ -285,6 +380,7 @@ impl JtagCommand for ShiftTmsCommand {
     }
 }
 
+/// Clock bits to TDI, does not receive bits from TDO
 #[derive(Debug)]
 struct ShiftTdiCommand {
     data: Vec<u8>,
@@ -350,6 +446,7 @@ impl JtagCommand for ShiftTdiCommand {
     }
 }
 
+/// Clock bits to TDI while also receiving bits from TDO
 #[derive(Debug)]
 struct TransferTdiCommand {
     data: Vec<u8>,
@@ -426,15 +523,71 @@ impl JtagCommand for TransferTdiCommand {
     }
 
     fn process_output(&self, data: &[u8]) -> Result<CommandResult, DebugProbeError> {
-        let mut last_byte = data[data.len() - 1] >> 7;
-        if self.bits > 1 {
-            let byte = data[data.len() - 2] >> (8 - (self.bits - 1));
-            last_byte = byte | (last_byte << (self.bits - 1));
-        }
+        let data_len = data.len();
+
+        // Last output byte always contains last TDO bit clocked back (as part of
+        // TMS command response). This bit is stored in bit 8 of the response byte
+        let tdo_bit_byte = data[data_len - 1] >> 7;
+
+        // Two cases here, both always recv back last TDO bit in final byte:
+        // 1. self.bits is 1 (unlikely).
+        //    In this case, every TDO bit recvd from the probe fits
+        //    into some number of full bytes, save the last bit
+        //
+        //    For ex, in the following sequence of TDO data recvd 0xFF, 0xFF, 0x80
+        //    the two 0xFF bytes are full bytes, but the last bit (a 1) is stored in
+        //    the most significant bit of the last byte.
+        //    When later converted from little endian to big endian, this ends up being 0x1FF
+        //
+        // 2. self.bits is between 2 and 7 inclusive (more likely).
+        //    In this case, the recvd TDO data is sequentially received in:
+        //      - 0 or more full bytes
+        //      - 1 to 7 bits in the 2nd to last byte
+        //      - 1 bit in the last byte
+        //
+        //    For example, the following 16 bit transfer: 0xFF, 0xEF, 0x80
+        //    Bits 1-8 are recvd in 0xFF, which is a full byte txfr.
+        //    Bits 9-15 are recvd in the uppermost seven bits of 0xFE,
+        //    which is a 7 bit txfr. Bit 16 is stored in the uppermost bit of 0x80.
+        //    When later converted from little-endian to big-endian, this ends up being 0xFF
+        let last_byte = match self.bits > 1 {
+            // Should always have data length >= 2 here
+            // (0+ full bytes, 1 byte w/ 1-7 bits, last byte with one bit)
+            true => {
+                // Grab the 1 to 7 bits stored in second to last byte
+                // and put in proper spot for combination
+                let byte = data[data_len - 2] >> (8 - (self.bits - 1));
+
+                // Combine with leftover bit to form last byte.
+                // Last byte doesn't necessarily contain full 8 bits of data.
+                // This happens when 2nd to last byte recvd contains < 7 bits of data
+                byte | (tdo_bit_byte << (self.bits - 1))
+            }
+            // Clocked out all data in full bytes save one leftover bit
+            // Last byte is unchanged
+            false => tdo_bit_byte,
+        };
 
         let mut reply = Vec::<u8>::new();
-        reply.extend_from_slice(data);
+
+        if data_len > 2 && self.bits <= 1 {
+            // Case 1 from above comment. Add all but last byte
+            reply.extend_from_slice(&data[..data_len - 1]);
+        } else if data_len > 2 && self.bits > 1 {
+            // Case 2 from above comment. Add all but last two bytes
+            // Last two bytes are combined into last_byte
+            reply.extend_from_slice(&data[..data_len - 2]);
+        } else if self.bits <= 1 {
+            // Case 1 from above comment and only two bytes in response.
+            // First byte is full byte of data, second only contains the final bit
+            // so only add the first full byte to reply
+            reply.push(data[0]);
+        }
+
+        // Always add back byte which contains final TDO bit
+        // (and possibly other non-full byte data clocked back)
         reply.push(last_byte);
+
         Ok(CommandResult::VecU8(reply))
     }
 }
