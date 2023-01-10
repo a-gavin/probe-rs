@@ -321,8 +321,34 @@ impl JtagAdapter {
         Ok(targets)
     }
 
-    pub fn select_target(&mut self, idcode: u32) -> io::Result<()> {
-        let taps = self.scan()?;
+    pub fn select_target(&mut self) -> Result<(), DebugProbeError> {
+        let taps = self
+            .scan()
+            .map_err(|e| DebugProbeError::ProbeSpecific(Box::new(e)))?;
+
+        if taps.is_empty() {
+            tracing::warn!("no JTAG taps detected");
+            return Err(DebugProbeError::TargetNotFound);
+        }
+
+        // If only one TAP, just use that. Otherwise, search for supported TAP IDCODEs in scanned TAPs
+        let idcode = if taps.len() == 1 {
+            taps[0].idcode
+        } else {
+            let known_idcodes = [
+                // GD32VF103 (other TAP detected on this chip is boundary scan, 0x790007a3)
+                0x1000563d,
+            ];
+            let idcode = taps
+                .iter()
+                .map(|tap| tap.idcode)
+                .find(|idcode| known_idcodes.iter().any(|v| v == idcode));
+
+            match idcode {
+                Some(idcode) => idcode,
+                None => return Err(DebugProbeError::TargetNotFound),
+            }
+        };
 
         let mut found = false;
         let mut params = ChainParams {
@@ -350,7 +376,8 @@ impl JtagAdapter {
             self.chain_params = Some(params);
             Ok(())
         } else {
-            Err(io::Error::new(io::ErrorKind::NotFound, "target not found"))
+            tracing::warn!("target not found");
+            Err(DebugProbeError::TargetNotFound)
         }
     }
 
@@ -474,35 +501,8 @@ impl DebugProbe for FtdiProbe {
             .attach()
             .map_err(|e| DebugProbeError::ProbeSpecific(Box::new(e)))?;
 
-        let taps = self
-            .adapter
-            .scan()
-            .map_err(|e| DebugProbeError::ProbeSpecific(Box::new(e)))?;
-        if taps.is_empty() {
-            tracing::warn!("no JTAG taps detected");
-            return Err(DebugProbeError::TargetNotFound);
-        }
-        if taps.len() == 1 {
-            self.adapter
-                .select_target(taps[0].idcode)
-                .map_err(|e| DebugProbeError::ProbeSpecific(Box::new(e)))?;
-        } else {
-            let known_idcodes = [
-                // GD32VF103 (other TAP detected on this chip is boundary scan, 0x790007a3)
-                0x1000563d,
-            ];
-            let idcode = taps
-                .iter()
-                .map(|tap| tap.idcode)
-                .find(|idcode| known_idcodes.iter().any(|v| v == idcode));
-            if let Some(idcode) = idcode {
-                self.adapter
-                    .select_target(idcode)
-                    .map_err(|e| DebugProbeError::ProbeSpecific(Box::new(e)))?;
-            } else {
-                return Err(DebugProbeError::TargetNotFound);
-            }
-        }
+        self.adapter.select_target()?;
+
         Ok(())
     }
 
